@@ -1,0 +1,90 @@
+From 7c3e9a1f2b4d5e6a8c0b1d2e3f4a5b6c7d8e9f0a Mon Sep 17 00:00:00 2001
+From: jacksongoode <jacksongoode@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 12:00:00 +0200
+Subject: [PATCH] Kompakt: pace GL swaps for the frame rate cap
+
+Choreographer covers what HWUI draws and nothing else. A SurfaceView, a GL
+app's own loop, or video drawn through a texture never asks it for a frame, so
+the divisor leaves them at full rate.
+
+This waits for the slot in eglSwapBuffers instead, before the frame is handed
+over, so the producer's loop stalls instead of rendering frames nobody sees.
+
+Off unless persist.sys.kompakt.swap_interval_ms is set, so a build carrying the
+patch behaves as before until something writes it. Uids below 10000 are left
+alone: SurfaceFlinger composites through EGL too, and the codec, camera and
+media services feed these surfaces.
+
+Per thread, so two render threads are paced independently. Frames a codec or the
+camera queues for itself never come through EGL and are not covered.
+---
+  opengl/libs/EGL/eglApi.cpp | 36 ++++++++++++++++++++++++++++++++++++
+  1 file changed, 36 insertions(+)
+
+diff --git a/opengl/libs/EGL/eglApi.cpp b/opengl/libs/EGL/eglApi.cpp
+index 8cb637b..2f755fb 100644
+--- a/opengl/libs/EGL/eglApi.cpp
++++ b/opengl/libs/EGL/eglApi.cpp
+@@ -19,6 +19,10 @@
+ #include <EGL/egl.h>
+ #include <EGL/eglext.h>
+ 
++#include <android-base/properties.h>
++#include <time.h>
++#include <unistd.h>
++
+ #include "../egl_impl.h"
+ #include "egl_layers.h"
+ #include "egl_platform_entries.h"
+@@ -248,10 +252,41 @@ __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char* procname)
+     return cnx->platform.eglGetProcAddress(procname);
+ }
+ 
++namespace {
++
++// Kompakt: a producer that never touches the Choreographer -- a SurfaceView, a
++// GL loop, video through a texture -- waits for the slot here instead. Uids
++// below 10000 (SurfaceFlinger, codec, camera) feed these surfaces and keep
++// their rate. Unset, nothing waits.
++void kompaktPaceSwaps() {
++    static const int64_t periodNs = [] {
++        int32_t ms = android::base::GetIntProperty("persist.sys.kompakt.swap_interval_ms", 0);
++        return static_cast<int64_t>(ms) * 1000000;
++    }();
++    if (periodNs == 0 || getuid() < 10000) return;
++
++    thread_local int64_t lastNs = 0;
++    timespec now;
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    int64_t nowNs = static_cast<int64_t>(now.tv_sec) * 1000000000 + now.tv_nsec;
++    if (lastNs != 0 && nowNs - lastNs < periodNs) {
++        int64_t waitNs = periodNs - (nowNs - lastNs);
++        timespec pause = {static_cast<time_t>(waitNs / 1000000000),
++                          static_cast<long>(waitNs % 1000000000)};
++        nanosleep(&pause, nullptr);
++        clock_gettime(CLOCK_MONOTONIC, &now);
++        nowNs = static_cast<int64_t>(now.tv_sec) * 1000000000 + now.tv_nsec;
++    }
++    lastNs = nowNs;
++}
++
++}  // namespace
++
+ EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay dpy, EGLSurface draw, const EGLint* rects,
+                                        EGLint n_rects) {
+     ATRACE_CALL();
+     clearError();
++    kompaktPaceSwaps();
+ 
+     egl_connection_t* const cnx = &gEGLImpl;
+     return cnx->platform.eglSwapBuffersWithDamageKHR(dpy, draw, rects, n_rects);
+@@ -260,6 +295,7 @@ EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay dpy, EGLSurface draw, const EG
+ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+     ATRACE_CALL();
+     clearError();
++    kompaktPaceSwaps();
+ 
+     egl_connection_t* const cnx = &gEGLImpl;
+     return cnx->platform.eglSwapBuffers(dpy, surface);
+-- 
+2.56.0
